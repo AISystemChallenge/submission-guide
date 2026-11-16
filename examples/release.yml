@@ -1,0 +1,58 @@
+# 예시: release를 publish하면 이미지를 빌드해 ghcr.io에 push합니다.
+# GITHUB_TOKEN으로 push하면 이미지가 이 저장소에 자동으로 연결됩니다.
+# 저장소 루트에 Dockerfile이 있다고 가정합니다. 다르면 build-push-action의 context와 file을 바꾸세요.
+#
+# 이 파일은 release 때의 이미지 push만 맡습니다. 등록 1회(collaborator 초대, webhook)는 따로 해야 합니다.
+name: release-image
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  image:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      # github.repository는 대문자를 포함할 수 있고, 이미지 이름은 소문자여야 합니다.
+      # 값은 env로 넘겨 shell이 직접 보간하지 않게 합니다.
+      - name: Image name in lower case
+        id: image
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: echo "name=ghcr.io/$(echo "$REPOSITORY" | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # 이미지 tag는 release tag와 같게 합니다. label은 이미지를 이 저장소에 연결합니다.
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.image.outputs.name }}:${{ github.event.release.tag_name }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+
+      # (선택) release 본문 끝에 pull 줄을 덧붙입니다. 본문에 주소를 적지 않아도 시스템이 연결된 패키지에서 release tag와 같은
+      # tag를 찾으므로 필수가 아닙니다. 쓰려면 위 permissions의 contents를 write로 바꾸고 아래 주석을 해제하세요.
+      # release 값은 모두 env로 넘깁니다. run 안에 github.event 값을 직접 넣지 마세요.
+      #
+      # - name: Add the pull line to the release body
+      #   env:
+      #     GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      #     IMAGE: ${{ steps.image.outputs.name }}
+      #     TAG: ${{ github.event.release.tag_name }}
+      #     BODY: ${{ github.event.release.body }}
+      #   run: gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --notes "$BODY"$'\n\n'"docker pull $IMAGE:$TAG"
