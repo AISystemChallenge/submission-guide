@@ -1,60 +1,61 @@
 # AI System Challenge 제출 workflow (모든 팀 공통, AISC_IMAGE만 팀마다 다릅니다)
 # 팀 등록 때 AISystemChallenge가 이 파일을 저장소 기본 branch에 commit합니다.
-# 정식 release를 발행(publish)하면 Dockerfile로 이미지를 빌드해 AISC_IMAGE:<release tag>로 ghcr.io에 push합니다.
-# 대회 시스템은 이 저장소에 연결된 패키지에서 release tag와 같은 tag를 찾아 제출로 접수합니다.
-# pre-release도 같은 방법으로 빌드하지만(시험 빌드) 제출이 아닙니다.
-# GITHUB_TOKEN으로 push하므로 이미지 패키지는 이 저장소에 자동으로 연결됩니다.
+# 이 workflow는 이미지를 빌드하지 않습니다. 직접 빌드한 이미지를 AISC_IMAGE:<tag>로 ghcr.io에 push하면
+# GitHub의 패키지 이벤트(registry_package)로 실행되어 그 tag 이름의 정식 release를 기본 branch에 만듭니다.
+# 대회 시스템은 그 release를 받아 이 저장소에 연결된 패키지에서 같은 tag를 찾아 제출로 접수합니다.
+# 건너뛰는 경우: tag 없는 이벤트(같은 push의 플랫폼별 manifest 등), 등록한 이름이 아닌 패키지, latest tag,
+# 같은 tag의 release가 이미 있을 때(같은 tag를 다시 push해도 다시 제출되지 않습니다).
+# docker tag 규칙에 맞지 않는 tag는 오류로 멈춥니다.
 name: AI System Challenge submission
 
 on:
-  release:
-    types: [published]
+  registry_package:
+    types: [published, updated]
 
 permissions:
-  contents: read
-  packages: write
+  contents: write
 
 env:
   # 팀 등록 때 자동 기록. 바꾸면 제출 이미지를 찾지 못합니다.
   AISC_IMAGE: ghcr.io/<owner>/<name>
-  # Dockerfile 경로(저장소 루트 기준). 다시 등록하면 기본값으로 돌아갑니다.
-  AISC_DOCKERFILE: Dockerfile
 
 jobs:
-  image:
+  release:
     runs-on: ubuntu-latest
+    # tag 없는 이벤트는 job을 시작하지 않습니다.
+    if: ${{ github.event.registry_package.package_version.container_metadata.tag.name != '' }}
     steps:
-      # release 값은 env로만 넘깁니다(run 안에 github.event 값을 직접 넣지 않습니다).
-      - name: Check the release tag
-        id: image
+      # 이벤트 값은 env로만 넘깁니다(run 안에 github.event 값을 직접 넣지 않습니다).
+      - name: Release the pushed tag
         env:
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          OWNER: ${{ github.repository_owner }}
+          PKG_NAME: ${{ github.event.registry_package.name }}
+          PKG_TAG: ${{ github.event.registry_package.package_version.container_metadata.tag.name }}
+          PKG_DIGEST: ${{ github.event.registry_package.package_version.container_metadata.tag.digest }}
         run: |
-          if [[ ! "$RELEASE_TAG" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
-            echo "::error::release tag가 docker tag 규칙(영문·숫자·_ . -, 128자 이하, 첫 글자는 영문·숫자·_)에 맞지 않아 이미지를 만들지 않습니다."
+          set -euo pipefail
+          if [ -z "${PKG_TAG}" ]; then
+            echo "tag 없는 이벤트라 건너뜁니다."
+            exit 0
+          fi
+          image="ghcr.io/${OWNER,,}/${PKG_NAME,,}"
+          if [ "${image}" != "${AISC_IMAGE}" ]; then
+            echo "등록한 이미지가 아니라 건너뜁니다: ${image}"
+            exit 0
+          fi
+          if [[ ! "${PKG_TAG}" =~ ^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$ ]]; then
+            echo "::error::push한 tag가 docker tag 규칙(영문·숫자·_ . -, 128자 이하, 첫 글자는 영문·숫자·_)에 맞지 않아 release를 만들지 않습니다."
             exit 1
           fi
-          echo "ref=${AISC_IMAGE}:${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
-
-      - name: Checkout
-        uses: actions/checkout@v7
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4
-
-      - name: Log in to ghcr.io
-        uses: docker/login-action@v4
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push
-        uses: docker/build-push-action@v7
-        with:
-          context: .
-          file: ${{ env.AISC_DOCKERFILE }}
-          push: true
-          tags: ${{ steps.image.outputs.ref }}
-          labels: |
-            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          if [ "${PKG_TAG}" = "latest" ]; then
+            echo "::notice::latest tag는 제출하지 않습니다. 버전 tag(예: v1.0.0)를 붙여 다시 push하세요."
+            exit 0
+          fi
+          if gh release view "${PKG_TAG}" --repo "${REPO}" >/dev/null 2>&1; then
+            echo "release ${PKG_TAG}가 이미 있어 건너뜁니다(같은 tag를 다시 push해도 다시 제출되지 않습니다)."
+            exit 0
+          fi
+          branch="$(gh api "repos/${REPO}" --jq .default_branch)"
+          gh release create "${PKG_TAG}" --repo "${REPO}" --target "${branch}" --title "${PKG_TAG}" --notes "제출 이미지 ${AISC_IMAGE}:${PKG_TAG} (${PKG_DIGEST}) — GHCR push로 자동 생성"
